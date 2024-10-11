@@ -333,53 +333,219 @@ void VulkanReplayConsumerBase::ProcessFillMemoryCommand(uint64_t       memory_id
             void*                           buffer_data = nullptr;
             const HardwareBufferMemoryInfo& buffer_info = entry->second;
 
-            int lock_result = AHardwareBuffer_lock(
-                buffer_info.hardware_buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &buffer_data);
+            AHardwareBuffer_Desc desc;
+            AHardwareBuffer_describe(buffer_info.hardware_buffer, &desc);
 
-            if (lock_result == 0)
+            if ((desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) != 0)
             {
-                assert(buffer_data != nullptr);
 
-                if (buffer_info.plane_info.size() == 1)
+                int lock_result = AHardwareBuffer_lock(
+                    buffer_info.hardware_buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &buffer_data);
+
+                if (lock_result == 0)
                 {
-                    GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, size);
-                    GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, offset);
+                    assert(buffer_data != nullptr);
 
-                    size_t   data_size         = static_cast<size_t>(size);
-                    size_t   data_offset       = static_cast<size_t>(offset);
-                    size_t   capture_row_pitch = buffer_info.plane_info[0].capture_row_pitch;
-                    size_t   replay_row_pitch  = buffer_info.plane_info[0].replay_row_pitch;
-                    uint32_t height            = buffer_info.plane_info[0].height;
+                    if (buffer_info.plane_info.size() == 1)
+                    {
+                        GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, size);
+                        GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, offset);
 
-                    resource::CopyImageSubresourceMemory(static_cast<uint8_t*>(buffer_data),
-                                                         data,
-                                                         data_offset,
-                                                         data_size,
-                                                         replay_row_pitch,
-                                                         capture_row_pitch,
-                                                         height);
+                        size_t   data_size         = static_cast<size_t>(size);
+                        size_t   data_offset       = static_cast<size_t>(offset);
+                        size_t   capture_row_pitch = buffer_info.plane_info[0].capture_row_pitch;
+                        size_t   replay_row_pitch  = buffer_info.plane_info[0].replay_row_pitch;
+                        uint32_t height            = buffer_info.plane_info[0].height;
+
+                        resource::CopyImageSubresourceMemory(static_cast<uint8_t*>(buffer_data),
+                                                             data,
+                                                             data_offset,
+                                                             data_size,
+                                                             replay_row_pitch,
+                                                             capture_row_pitch,
+                                                             height);
+                    }
+                    else
+                    {
+                        // TODO: multi-plane image format support when strides do not match.
+                        GFXRECON_LOG_WARNING(
+                            "Ignoring fill memory command for AHardwareBuffer with multi-plane format and "
+                            "mismatched capture/replay strides (Memory ID = %" PRIu64 "): support not yet implemented",
+                            memory_id);
+                    }
+
+                    lock_result = AHardwareBuffer_unlock(buffer_info.hardware_buffer, nullptr);
+                    if (lock_result != 0)
+                    {
+                        GFXRECON_LOG_WARNING(
+                            "AHardwareBuffer_unlock failed for AHardwareBuffer object (Memory ID = %" PRIu64 ")",
+                            memory_id);
+                    }
                 }
                 else
                 {
-                    // TODO: multi-plane image format support when strides do not match.
-                    GFXRECON_LOG_WARNING("Ignoring fill memory command for AHardwareBuffer with multi-plane format and "
-                                         "mismatched capture/replay strides (Memory ID = %" PRIu64
-                                         "): support not yet implemented",
-                                         memory_id);
-                }
-
-                lock_result = AHardwareBuffer_unlock(buffer_info.hardware_buffer, nullptr);
-                if (lock_result != 0)
-                {
                     GFXRECON_LOG_WARNING(
-                        "AHardwareBuffer_unlock failed for AHardwareBuffer object (Memory ID = %" PRIu64 ")",
-                        memory_id);
+                        "AHardwareBuffer_lock failed for AHardwareBuffer object (Memory ID = %" PRIu64 ")", memory_id);
                 }
             }
             else
             {
-                GFXRECON_LOG_WARNING("AHardwareBuffer_lock failed for AHardwareBuffer object (Memory ID = %" PRIu64 ")",
-                                     memory_id);
+                DeviceInfo* device_info  = object_info_table_.GetDeviceInfo(buffer_info.device_id);
+                VkDevice    device       = device_info->handle;
+                auto        device_table = GetDeviceTable(device);
+                auto        table        = GetDeviceTable(device);
+
+                VkExternalMemoryBufferCreateInfo externalMemoryBufferCreateInfo;
+                externalMemoryBufferCreateInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+                externalMemoryBufferCreateInfo.pNext = nullptr;
+                externalMemoryBufferCreateInfo.handleTypes =
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+                VkBufferCreateInfo bufferCreateInfo;
+                bufferCreateInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bufferCreateInfo.pNext       = &externalMemoryBufferCreateInfo;
+                bufferCreateInfo.flags       = 0u;
+                bufferCreateInfo.size        = size;
+                bufferCreateInfo.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                bufferCreateInfo.queueFamilyIndexCount = 0u;
+                bufferCreateInfo.pQueueFamilyIndices   = nullptr;
+
+                VkBuffer ahbDataBuffer;
+                device_table->CreateBuffer(device, &bufferCreateInfo, nullptr, &ahbDataBuffer);
+
+                VkMemoryRequirements memoryRequirements;
+                device_table->GetBufferMemoryRequirements(device, ahbDataBuffer, &memoryRequirements);
+
+                VkImportAndroidHardwareBufferInfoANDROID importAHBInfo;
+                importAHBInfo.sType  = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+                importAHBInfo.pNext  = nullptr;
+                importAHBInfo.buffer = buffer_info.hardware_buffer;
+
+                VkMemoryAllocateInfo memoryAllocateInfo;
+                memoryAllocateInfo.sType          = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                memoryAllocateInfo.pNext          = &importAHBInfo;
+                memoryAllocateInfo.allocationSize = memoryRequirements.size;
+
+                PhysicalDeviceInfo* physical_device_info = object_info_table_.GetPhysicalDeviceInfo(device_info->parent_id);
+                VkPhysicalDeviceMemoryProperties* memory_properties = &physical_device_info->capture_memory_properties;
+
+                uint32_t memoryIndex = memory_properties->memoryTypeCount;
+                for (uint32_t i = 0; i < memory_properties->memoryTypeCount; ++i)
+                {
+                    if ((memoryRequirements.memoryTypeBits & (1 << i)) &&
+                        (memory_properties->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) > 0)
+                    {
+                        memoryIndex = i;
+                    }
+                }
+                assert(memoryIndex < memory_properties->memoryTypeCount);
+                memoryAllocateInfo.memoryTypeIndex = memoryIndex;
+
+                VkDeviceMemory bufferMemory;
+                device_table->AllocateMemory(device, &memoryAllocateInfo, nullptr, &bufferMemory);
+
+                device_table->BindBufferMemory(device, ahbDataBuffer, bufferMemory, 0);
+
+                VkBufferCreateInfo hostReadableBufferInfo;
+                hostReadableBufferInfo.sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                hostReadableBufferInfo.pNext                 = nullptr;
+                hostReadableBufferInfo.flags                 = 0u;
+                hostReadableBufferInfo.size                  = size;
+                hostReadableBufferInfo.usage                 = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                hostReadableBufferInfo.sharingMode           = VK_SHARING_MODE_EXCLUSIVE;
+                hostReadableBufferInfo.queueFamilyIndexCount = 0u;
+                hostReadableBufferInfo.pQueueFamilyIndices   = nullptr;
+
+                VkBuffer hostReadableBuffer;
+                device_table->CreateBuffer(device, &hostReadableBufferInfo, nullptr, &hostReadableBuffer);
+
+                VkMemoryRequirements hostReabableMemeryRequirements;
+                device_table->GetBufferMemoryRequirements(device, hostReadableBuffer, &hostReabableMemeryRequirements);
+
+                VkMemoryAllocateInfo hostReadableAllocateInfo;
+                hostReadableAllocateInfo.sType          = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                hostReadableAllocateInfo.pNext          = nullptr;
+                hostReadableAllocateInfo.allocationSize = hostReabableMemeryRequirements.size;
+
+                memoryIndex = memory_properties->memoryTypeCount;
+                for (uint32_t i = 0; i < memory_properties->memoryTypeCount; ++i)
+                {
+                    if ((hostReabableMemeryRequirements.memoryTypeBits & (1 << i)) &&
+                        (memory_properties->memoryTypes[i].propertyFlags &
+                         (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                    {
+                        memoryIndex = i;
+                    }
+                }
+                assert(memoryIndex < memory_properties->memoryTypeCount);
+                hostReadableAllocateInfo.memoryTypeIndex = memoryIndex;
+
+                VkDeviceMemory hostReadableBufferMemory;
+                device_table->AllocateMemory(device, &hostReadableAllocateInfo, nullptr, &hostReadableBufferMemory);
+
+                device_table->BindBufferMemory(device, hostReadableBuffer, hostReadableBufferMemory, 0);
+
+                void* hostReadableBufferData;
+                device_table->MapMemory(device, hostReadableBufferMemory, 0u, size, 0u, &hostReadableBufferData);
+                memcpy(hostReadableBufferData, data, size);
+
+                VkCommandPoolCreateInfo commandPoolCreateInfo;
+                commandPoolCreateInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+                commandPoolCreateInfo.pNext            = nullptr;
+                commandPoolCreateInfo.flags            = 0u;
+                commandPoolCreateInfo.queueFamilyIndex = 0u; // Todo
+
+                VkCommandPool commandPool;
+                device_table->CreateCommandPool(device, &commandPoolCreateInfo, nullptr, &commandPool);
+
+                VkCommandBufferAllocateInfo commandBufferAllocateInfo;
+                commandBufferAllocateInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+                commandBufferAllocateInfo.pNext              = nullptr;
+                commandBufferAllocateInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                commandBufferAllocateInfo.commandPool        = commandPool;
+                commandBufferAllocateInfo.commandBufferCount = 1;
+
+                VkCommandBuffer commandBuffer;
+                device_table->AllocateCommandBuffers(device, &commandBufferAllocateInfo, &commandBuffer);
+
+                VkCommandBufferBeginInfo commandBufferBeginInfo;
+                commandBufferBeginInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                commandBufferBeginInfo.pNext            = nullptr;
+                commandBufferBeginInfo.flags            = 0u;
+                commandBufferBeginInfo.pInheritanceInfo = nullptr;
+                device_table->BeginCommandBuffer(commandBuffer, &commandBufferBeginInfo);
+
+                VkBufferCopy copyRegion = {};
+                copyRegion.size         = size;
+                device_table->CmdCopyBuffer(commandBuffer, hostReadableBuffer, ahbDataBuffer, 1, &copyRegion);
+
+                device_table->EndCommandBuffer(commandBuffer);
+
+                VkSubmitInfo submitInfo;
+                submitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submitInfo.pNext                = nullptr;
+                submitInfo.waitSemaphoreCount   = 0u;
+                submitInfo.pWaitSemaphores      = nullptr;
+                submitInfo.pWaitDstStageMask    = nullptr;
+                submitInfo.commandBufferCount   = 1u;
+                submitInfo.pCommandBuffers      = &commandBuffer;
+                submitInfo.signalSemaphoreCount = 0u;
+                submitInfo.pSignalSemaphores    = nullptr;
+
+                VkQueue queue;
+                device_table->GetDeviceQueue(device, 0u, 0u, &queue);
+                //auto queue = device_wrapper->child_queues[0]->handle;
+                device_table->QueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+                device_table->QueueWaitIdle(queue);
+
+                device_table->FreeMemory(device, bufferMemory, nullptr);
+                device_table->FreeMemory(device, hostReadableBufferMemory, nullptr);
+                device_table->DestroyBuffer(device, ahbDataBuffer, nullptr);
+                device_table->DestroyBuffer(device, hostReadableBuffer, nullptr);
+
+                GFXRECON_LOG_WARNING("HERE AHB %u", buffer_info.device_id);
             }
         }
     }
@@ -471,6 +637,7 @@ void VulkanReplayConsumerBase::ProcessResizeWindowCommand2(format::HandleId surf
 }
 
 void VulkanReplayConsumerBase::ProcessCreateHardwareBufferCommand(
+    format::HandleId                                    device_id,
     format::HandleId                                    memory_id,
     uint64_t                                            buffer_id,
     uint32_t                                            format,
@@ -543,6 +710,7 @@ void VulkanReplayConsumerBase::ProcessCreateHardwareBufferCommand(
 
         HardwareBufferMemoryInfo& memory_info = hardware_buffer_memory_info_[memory_id];
         memory_info.hardware_buffer           = buffer;
+        memory_info.device_id                 = device_id;
         memory_info.compatible_strides        = true;
 
         // Check for matching strides.

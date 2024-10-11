@@ -121,7 +121,8 @@ class MetadataJsonConsumer : public Base
     }
 
     virtual void
-    ProcessCreateHardwareBufferCommand(format::HandleId                                    memory_id,
+    ProcessCreateHardwareBufferCommand(format::HandleId                                    device_id,
+                                       format::HandleId                                    memory_id,
                                        uint64_t                                            buffer_id,
                                        uint32_t                                            format,
                                        uint32_t                                            width,
